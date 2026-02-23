@@ -1,3 +1,10 @@
+"""Python bindings for NanoTTS (SVOX Pico).
+
+The `NanoTTS` class exposes a `speak()` method that returns raw PCM audio
+(`16 kHz`, mono, 16-bit little-endian). This module also defines the supported
+voices and parameter bounds used for input clamping.
+"""
+
 from enum import Enum
 from typing import Optional, Union
 
@@ -10,6 +17,7 @@ MAX_VOLUME = 5.0
 
 
 class Voice(str, Enum):
+    """Supported Pico voice identifiers."""
     en_GB = "en-GB"
     en_US = "en-US"
     de_DE = "de-DE"
@@ -19,6 +27,14 @@ class Voice(str, Enum):
 
 
 class NanoTTS:
+    """Text-to-speech wrapper for NanoTTS.
+
+    `speak()` returns raw PCM audio bytes with the following format:
+
+    - sample rate: 16 kHz
+    - channels: 1 (mono)
+    - sample width: 16-bit little-endian
+    """
     def speak(
         self,
         text: str,
@@ -27,6 +43,18 @@ class NanoTTS:
         pitch: Optional[float] = None,
         volume: Optional[float] = None,
     ) -> bytes:
+        """Synthesize text to raw PCM bytes.
+
+        Args:
+            text: Text to synthesize.
+            voice: Voice identifier (e.g. "en-GB") or `Voice` enum.
+            speed: Optional speed multiplier ($0.2$-$5.0$).
+            pitch: Optional pitch multiplier ($0.5$-$2.0$).
+            volume: Optional volume multiplier ($0.0$-$5.0$).
+
+        Returns:
+            Raw PCM audio bytes (16 kHz, mono, 16-bit LE).
+        """
         if speed is not None:
             speed = max(MIN_SPEED, min(MAX_SPEED, speed))
 
@@ -51,6 +79,11 @@ class NanoTTS:
 
 
 def _default_lingware_path() -> str:
+    """Resolve the installed lingware path.
+
+    Prefers the packaged `py_nanotts/lang` directory if present, then falls
+    back to the repository layout under `nanotts/lang`.
+    """
     import os
     try:
         from importlib import resources

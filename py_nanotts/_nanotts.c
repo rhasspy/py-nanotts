@@ -361,33 +361,10 @@ static PyObject *nanotts_speak(PyObject *self, PyObject *args, PyObject *kwargs)
     }
 
     {
-        unsigned int data_size = (unsigned int)pcm_size;
-        unsigned int header_size = 44;
-        unsigned int total_size = header_size + data_size;
-        PyObject *result = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)total_size);
+        PyObject *result = PyBytes_FromStringAndSize(
+            (const char *)pcm_data, (Py_ssize_t)pcm_size);
         if (!result) {
             goto cleanup_pcm;
-        }
-        unsigned char *out = (unsigned char *)PyBytes_AsString(result);
-        if (!out) {
-            Py_DECREF(result);
-            goto cleanup_pcm;
-        }
-        memcpy(out, "RIFF", 4);
-        write_le32(out + 4, 36 + data_size);
-        memcpy(out + 8, "WAVE", 4);
-        memcpy(out + 12, "fmt ", 4);
-        write_le32(out + 16, 16);
-        write_le16(out + 20, 1);
-        write_le16(out + 22, 1);
-        write_le32(out + 24, 16000);
-        write_le32(out + 28, 16000 * 2);
-        write_le16(out + 32, 2);
-        write_le16(out + 34, 16);
-        memcpy(out + 36, "data", 4);
-        write_le32(out + 40, data_size);
-        if (data_size > 0) {
-            memcpy(out + header_size, pcm_data, data_size);
         }
 
         free(pcm_data);
