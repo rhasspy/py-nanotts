@@ -24,7 +24,7 @@ jobs:
 
       - name: Install library
         run: |
-          pip install pytest
+          pip install pytest setuptools
           pip install --no-build-isolation -v .
 
       - name: Run tests
