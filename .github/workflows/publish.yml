@@ -28,6 +28,7 @@ jobs:
         run: pip install setuptools wheel build
 
       - name: Get version from setup.py
+        shell: bash
         run: |
           VERSION=$(sed -n "s/.*version=['\"]\([^'\"]*\)['\"].*/\1/p" setup.py)
           echo "VERSION=$VERSION" >> $GITHUB_ENV
