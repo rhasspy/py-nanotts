@@ -49,9 +49,9 @@ jobs:
              sys.exit(1)
           tag = ref[len(prefix):]
 
-           if tag != ver:
-             print(f"Tag ({tag}) != setup.py ({ver})", file=sys.stderr)
-             sys.exit(1)
+          if tag != ver:
+            print(f"Tag ({tag}) != setup.py ({ver})", file=sys.stderr)
+            sys.exit(1)
 
           # Expose outputs
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
