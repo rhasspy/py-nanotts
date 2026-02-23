@@ -82,7 +82,9 @@ jobs:
         run: python -m build --sdist
 
       - name: Move wheels
-        run: mv wheelhouse/*.whl dist/
+        run: |
+          mkdir -p dist
+          mv wheelhouse/*.whl dist/
 
       - name: Upload wheels and sdist
         uses: actions/upload-artifact@v4
