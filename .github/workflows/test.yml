@@ -24,9 +24,8 @@ jobs:
 
       - name: Install library
         run: |
-          pip install pytest setuptools build
-          python -m build --wheel --outdir wheelhouse
-          pip install --find-links wheelhouse 'py-nanotts'
+          pip install pytest setuptools
+          pip install .
 
       - name: Run tests
         run: pytest -vv
