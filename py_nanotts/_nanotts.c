@@ -4,9 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "picoapi.h"
-#include "picoapid.h"
-#include "picoos.h"
+#include <picoapi.h>
+#include <picoapid.h>
+#include <picoos.h>
 
 #define PICO_MEM_SIZE 2500000
 #define MAX_OUTBUF_SIZE 128
