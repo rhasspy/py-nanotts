@@ -119,6 +119,7 @@ jobs:
           path: dist
 
       - name: Install wheel
+        shell: bash
         env:
           VER: ${{ needs.build.outputs.file_ver }}
         run: |
