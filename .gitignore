@@ -13,3 +13,5 @@ htmlcov
 __pycache__/
 .pytest_cache/
 *.wav
+/dist/
+/build/

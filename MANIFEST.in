@@ -1,0 +1,2 @@
+recursive-include py_nanotts/lang *
+recursive-include nanotts/lang *

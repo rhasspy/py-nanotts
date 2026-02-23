@@ -1,12 +1,8 @@
 from setuptools import Extension, setup
 import glob
-import os
 
 svoxpico_sources = glob.glob("nanotts/svoxpico/*.c")
 lingware_files = sorted(glob.glob("nanotts/lang/*"))
-data_files = []
-if lingware_files:
-    data_files.append((os.path.join("py_nanotts", "lang"), lingware_files))
 
 ext_modules = [
     Extension(
@@ -26,6 +22,7 @@ setup(
     description="Python bindings for NanoTTS (PicoTTS)",
     packages=["py_nanotts"],
     ext_modules=ext_modules,
-    data_files=data_files,
+    include_package_data=True,
+    package_data={"py_nanotts": ["lang/*"]},
     zip_safe=False,
 )
