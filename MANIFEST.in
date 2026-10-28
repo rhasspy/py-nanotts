@@ -2,3 +2,4 @@ recursive-include py_nanotts/lang *
 recursive-include nanotts/lang *
 recursive-include nanotts/svoxpico *.c *.h
 include LICENSE.md
+include README.md

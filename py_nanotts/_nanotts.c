@@ -5,6 +5,7 @@
 
 #include <limits.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,10 @@
 #define PICO_INT16_MAX 32767
 #endif
 
+// Upper bound for markup level values; keeps the int conversion defined and
+// the formatted tags within their fixed-size buffers.
+#define MAX_MARKUP_LEVEL 10000
+
 static const char *pico_supported_lang[] = {"en-US", "en-GB", "de-DE",
                                             "es-ES", "fr-FR", "it-IT"};
 static const char *pico_internal_ta[] = {"en-US_ta.bin", "en-GB_ta.bin",
@@ -35,6 +40,44 @@ static const int pico_num_supported = 6;
 // == char. If your Pico build defines pico_Char differently, you must provide a
 // real conversion.
 static const pico_Char pico_voice_name[] = "PicoVoice";
+
+// Synthesis runs without the GIL, so errors are collected here and raised as
+// Python exceptions once the GIL is held again.
+typedef enum {
+    SYNTH_OK = 0,
+    SYNTH_ERR_MEMORY,
+    SYNTH_ERR_VALUE,
+    SYNTH_ERR_RUNTIME,
+} synth_error_kind;
+
+typedef struct {
+    synth_error_kind kind;
+    char message[256];
+} synth_error;
+
+static int set_error(synth_error *err, synth_error_kind kind, const char *fmt,
+                     ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(err->message, sizeof(err->message), fmt, ap);
+    va_end(ap);
+    err->kind = kind;
+    return 0;
+}
+
+static void raise_synth_error(const synth_error *err) {
+    switch (err->kind) {
+    case SYNTH_ERR_MEMORY:
+        PyErr_NoMemory();
+        break;
+    case SYNTH_ERR_VALUE:
+        PyErr_SetString(PyExc_ValueError, err->message);
+        break;
+    default:
+        PyErr_SetString(PyExc_RuntimeError, err->message);
+        break;
+    }
+}
 
 static int find_voice_index(const char *voice) {
     for (int i = 0; i < pico_num_supported; i++) {
@@ -103,100 +146,75 @@ static int append_pcm(unsigned char **buffer, size_t *size, size_t *capacity,
     return 1;
 }
 
-// Safe helper: join "<tag ...>" prefixes and "</tag>" suffixes around text
-// Returns synth_text pointer and sets *need_free if malloc'd.
-// On failure, sets Python exception and returns NULL.
+static int markup_level(double value) {
+    double level = ceil(value * 100.0);
+    if (!(level >= 0.0)) { // also catches NaN
+        return 0;
+    }
+    if (level > MAX_MARKUP_LEVEL) {
+        return MAX_MARKUP_LEVEL;
+    }
+    return (int)level;
+}
+
+// Wrap text in speed/pitch/volume markup (negative values are omitted).
+//
+// Pico interprets markup anywhere in its input, including <genfile> and <play>
+// which write and read arbitrary files. There is no escape syntax, so every
+// '<' in the caller's text is replaced with a space. Only an ASCII '<' starts
+// a tag, and it can't appear inside a multi-byte UTF-8 sequence.
+//
+// Returns a malloc'd string, or NULL with err set.
 static char *build_synth_text(const char *text_utf8, double speed, double pitch,
-                              double volume, int *need_free) {
-    *need_free = 0;
+                              double volume, synth_error *err) {
+    // Each tag is at most 22 chars with level <= MAX_MARKUP_LEVEL
+    char open_tags[96];
+    char close_tags[32];
+    size_t open_len = 0;
 
-    char open_tags[128];
-    char close_tags[128];
     open_tags[0] = '\0';
-    close_tags[0] = '\0';
-
-    // Helper macro to prepend to close_tags safely.
-    // We build close_tags by prepending the new close tag before existing
-    // close_tags.
-#define PREPEND_CLOSE_TAG(CLOSE_STR)                                           \
-    do {                                                                       \
-        char _tmp[128];                                                        \
-        int _n =                                                               \
-            snprintf(_tmp, sizeof(_tmp), "%s%s", (CLOSE_STR), close_tags);     \
-        if (_n < 0 || (size_t)_n >= sizeof(_tmp)) {                            \
-            PyErr_SetString(PyExc_ValueError, "SSML tags too long");           \
-            return NULL;                                                       \
-        }                                                                      \
-        memcpy(close_tags, _tmp, (size_t)_n + 1);                              \
-    } while (0)
-
-    // Helper to append to open_tags safely.
-#define APPEND_OPEN_TAG(FMT, LEVEL)                                            \
-    do {                                                                       \
-        char _buf[64];                                                         \
-        int _n = snprintf(_buf, sizeof(_buf), (FMT), (LEVEL));                 \
-        if (_n < 0 || (size_t)_n >= sizeof(_buf)) {                            \
-            PyErr_SetString(PyExc_ValueError, "SSML tag formatting failed");   \
-            return NULL;                                                       \
-        }                                                                      \
-        size_t _cur = strlen(open_tags);                                       \
-        if (_cur + (size_t)_n >= sizeof(open_tags)) {                          \
-            PyErr_SetString(PyExc_ValueError, "SSML tags too long");           \
-            return NULL;                                                       \
-        }                                                                      \
-        memcpy(open_tags + _cur, _buf, (size_t)_n + 1);                        \
-    } while (0)
-
     if (speed >= 0.0) {
-        int level = (int)ceil(speed * 100.0);
-        APPEND_OPEN_TAG("<speed level=\"%d\">", level);
-        PREPEND_CLOSE_TAG("</speed>");
+        open_len += (size_t)snprintf(open_tags + open_len,
+                                     sizeof(open_tags) - open_len,
+                                     "<speed level=\"%d\">", markup_level(speed));
     }
     if (pitch >= 0.0) {
-        int level = (int)ceil(pitch * 100.0);
-        APPEND_OPEN_TAG("<pitch level=\"%d\">", level);
-        PREPEND_CLOSE_TAG("</pitch>");
+        open_len += (size_t)snprintf(open_tags + open_len,
+                                     sizeof(open_tags) - open_len,
+                                     "<pitch level=\"%d\">", markup_level(pitch));
     }
     if (volume >= 0.0) {
-        int level = (int)ceil(volume * 100.0);
-        APPEND_OPEN_TAG("<volume level=\"%d\">", level);
-        PREPEND_CLOSE_TAG("</volume>");
+        open_len += (size_t)snprintf(
+            open_tags + open_len, sizeof(open_tags) - open_len,
+            "<volume level=\"%d\">", markup_level(volume));
     }
 
-#undef APPEND_OPEN_TAG
-#undef PREPEND_CLOSE_TAG
-
-    const size_t open_len = strlen(open_tags);
+    snprintf(close_tags, sizeof(close_tags), "%s%s%s",
+             (volume >= 0.0) ? "</volume>" : "",
+             (pitch >= 0.0) ? "</pitch>" : "",
+             (speed >= 0.0) ? "</speed>" : "");
     const size_t close_len = strlen(close_tags);
 
-    if (open_len == 0 && close_len == 0) {
-        return (char *)text_utf8; // borrowed
-    }
-
     const size_t text_len = strlen(text_utf8);
-    if (open_len > SIZE_MAX - text_len) {
-        PyErr_NoMemory();
+    if (text_len > SIZE_MAX - open_len - close_len - 1) {
+        set_error(err, SYNTH_ERR_MEMORY, "out of memory");
         return NULL;
     }
-    const size_t mid = open_len + text_len;
-    if (close_len > SIZE_MAX - mid) {
-        PyErr_NoMemory();
-        return NULL;
-    }
-    const size_t total_len = mid + close_len;
 
-    char *synth_text = (char *)malloc(total_len + 1);
+    char *synth_text = (char *)malloc(open_len + text_len + close_len + 1);
     if (!synth_text) {
-        PyErr_NoMemory();
+        set_error(err, SYNTH_ERR_MEMORY, "out of memory");
         return NULL;
     }
 
     memcpy(synth_text, open_tags, open_len);
-    memcpy(synth_text + open_len, text_utf8, text_len);
-    memcpy(synth_text + open_len + text_len, close_tags, close_len);
-    synth_text[total_len] = '\0';
+    char *dst = synth_text + open_len;
+    for (size_t i = 0; i < text_len; i++) {
+        dst[i] = (text_utf8[i] == '<') ? ' ' : text_utf8[i];
+    }
+    memcpy(dst + text_len, close_tags, close_len);
+    synth_text[open_len + text_len + close_len] = '\0';
 
-    *need_free = 1;
     return synth_text;
 }
 
@@ -220,10 +238,58 @@ static int format_path(pico_Char *dst, const char *dir, const char *file) {
     return 1;
 }
 
+static int set_pico_error(synth_error *err, pico_System pico_system,
+                          pico_Status status, const char *what) {
+    pico_Retstring out_msg;
+    if (pico_system) {
+        pico_getSystemStatusMessage(pico_system, status, out_msg);
+        return set_error(err, SYNTH_ERR_RUNTIME, "%s failed: %s", what,
+                         out_msg);
+    }
+    return set_error(err, SYNTH_ERR_RUNTIME, "%s failed with status %d", what,
+                     (int)status);
+}
+
+// Drain available PCM from the engine into the output buffer.
+static int drain_pcm(pico_System pico_system, pico_Engine pico_engine,
+                     unsigned char **pcm_data, size_t *pcm_size,
+                     size_t *pcm_capacity, synth_error *err) {
+    unsigned char outbuf[MAX_OUTBUF_SIZE];
+    pico_Int16 bytes_recv = 0;
+    pico_Int16 out_data_type = 0;
+    pico_Int32 get_status = 0;
+
+    do {
+        bytes_recv = 0;
+        get_status = pico_getData(pico_engine, (void *)outbuf,
+                                  (pico_Int16)MAX_OUTBUF_SIZE, &bytes_recv,
+                                  &out_data_type);
+
+        if (get_status != PICO_STEP_BUSY && get_status != PICO_STEP_IDLE) {
+            return set_pico_error(err, pico_system, get_status,
+                                  "pico_getData");
+        }
+
+        if (bytes_recv < 0 || bytes_recv > (pico_Int16)MAX_OUTBUF_SIZE) {
+            return set_error(err, SYNTH_ERR_RUNTIME,
+                             "pico_getData returned invalid bytes_recv");
+        }
+
+        if (bytes_recv > 0) {
+            if (!append_pcm(pcm_data, pcm_size, pcm_capacity, outbuf,
+                            (size_t)bytes_recv)) {
+                return set_error(err, SYNTH_ERR_MEMORY, "out of memory");
+            }
+        }
+    } while (get_status == PICO_STEP_BUSY);
+
+    return 1;
+}
+
 // Feed UTF-8 text to Pico in safe chunks, gather PCM bytes in a growing buffer.
 static int synthesize_to_pcm(pico_System pico_system, pico_Engine pico_engine,
                              const char *synth_text, unsigned char **out_pcm,
-                             size_t *out_pcm_size) {
+                             size_t *out_pcm_size, synth_error *err) {
     *out_pcm = NULL;
     *out_pcm_size = 0;
 
@@ -231,27 +297,11 @@ static int synthesize_to_pcm(pico_System pico_system, pico_Engine pico_engine,
     size_t pcm_size = 0;
     size_t pcm_capacity = 0;
 
-    pico_Retstring out_msg;
-    pico_Status status;
-
     const unsigned char *inp = (const unsigned char *)synth_text;
 
     // IMPORTANT: include trailing NUL as end-of-input marker for Pico
-    size_t inp_len = strlen((const char *)inp);
-    if (inp_len == SIZE_MAX) { // paranoia
-        PyErr_SetString(PyExc_RuntimeError, "input too long");
-        goto fail;
-    }
-    inp_len += 1; // include '\0'
-
+    const size_t inp_len = strlen((const char *)inp) + 1;
     size_t offset = 0;
-
-    pico_Int16 bytes_sent = 0;
-    pico_Int16 bytes_recv = 0;
-    pico_Int16 out_data_type = 0;
-    pico_Int32 get_status = 0;
-
-    unsigned char outbuf[MAX_OUTBUF_SIZE];
 
     while (offset < inp_len) {
         size_t remaining = inp_len - offset;
@@ -260,82 +310,34 @@ static int synthesize_to_pcm(pico_System pico_system, pico_Engine pico_engine,
                                ? (pico_Int16)PICO_INT16_MAX
                                : (pico_Int16)remaining;
 
-        bytes_sent = 0;
-        status = pico_putTextUtf8(
+        pico_Int16 bytes_sent = 0;
+        pico_Status status = pico_putTextUtf8(
             pico_engine, (const pico_Char *)(inp + offset), chunk, &bytes_sent);
         if (status != PICO_OK) {
-            pico_getSystemStatusMessage(pico_system, status, out_msg);
-            PyErr_Format(PyExc_RuntimeError, "pico_putTextUtf8 failed: %s",
-                         out_msg);
+            set_pico_error(err, pico_system, status, "pico_putTextUtf8");
             goto fail;
         }
 
         // bytes_sent should always be positive and <= chunk
         if (bytes_sent <= 0 || bytes_sent > chunk) {
-            PyErr_SetString(PyExc_RuntimeError,
-                            "pico_putTextUtf8 returned invalid bytes_sent");
+            set_error(err, SYNTH_ERR_RUNTIME,
+                      "pico_putTextUtf8 returned invalid bytes_sent");
             goto fail;
         }
 
         offset += (size_t)bytes_sent;
 
-        do {
-            bytes_recv = 0;
-            get_status = pico_getData(pico_engine, (void *)outbuf,
-                                      (pico_Int16)MAX_OUTBUF_SIZE, &bytes_recv,
-                                      &out_data_type);
-
-            if (get_status != PICO_STEP_BUSY && get_status != PICO_STEP_IDLE) {
-                pico_getSystemStatusMessage(pico_system, get_status, out_msg);
-                PyErr_Format(PyExc_RuntimeError, "pico_getData failed: %s",
-                             out_msg);
-                goto fail;
-            }
-
-            if (bytes_recv < 0 || bytes_recv > (pico_Int16)MAX_OUTBUF_SIZE) {
-                PyErr_SetString(PyExc_RuntimeError,
-                                "pico_getData returned invalid bytes_recv");
-                goto fail;
-            }
-
-            if (bytes_recv > 0) {
-                if (!append_pcm(&pcm_data, &pcm_size, &pcm_capacity, outbuf,
-                                (size_t)bytes_recv)) {
-                    PyErr_NoMemory();
-                    goto fail;
-                }
-            }
-        } while (get_status == PICO_STEP_BUSY);
+        if (!drain_pcm(pico_system, pico_engine, &pcm_data, &pcm_size,
+                       &pcm_capacity, err)) {
+            goto fail;
+        }
     }
 
     // Final drain (often still needed)
-    do {
-        bytes_recv = 0;
-        get_status = pico_getData(pico_engine, (void *)outbuf,
-                                  (pico_Int16)MAX_OUTBUF_SIZE, &bytes_recv,
-                                  &out_data_type);
-
-        if (get_status != PICO_STEP_BUSY && get_status != PICO_STEP_IDLE) {
-            pico_getSystemStatusMessage(pico_system, get_status, out_msg);
-            PyErr_Format(PyExc_RuntimeError, "pico_getData failed: %s",
-                         out_msg);
-            goto fail;
-        }
-
-        if (bytes_recv < 0 || bytes_recv > (pico_Int16)MAX_OUTBUF_SIZE) {
-            PyErr_SetString(PyExc_RuntimeError,
-                            "pico_getData returned invalid bytes_recv");
-            goto fail;
-        }
-
-        if (bytes_recv > 0) {
-            if (!append_pcm(&pcm_data, &pcm_size, &pcm_capacity, outbuf,
-                            (size_t)bytes_recv)) {
-                PyErr_NoMemory();
-                goto fail;
-            }
-        }
-    } while (get_status == PICO_STEP_BUSY);
+    if (!drain_pcm(pico_system, pico_engine, &pcm_data, &pcm_size,
+                   &pcm_capacity, err)) {
+        goto fail;
+    }
 
     *out_pcm = pcm_data;
     *out_pcm_size = pcm_size;
@@ -344,6 +346,135 @@ static int synthesize_to_pcm(pico_System pico_system, pico_Engine pico_engine,
 fail:
     free(pcm_data);
     return 0;
+}
+
+// Full synthesis without touching the Python API, so it can run with the GIL
+// released. Each call gets its own Pico system, so calls may run concurrently.
+static int synthesize(const char *text_utf8, int lang_index,
+                      const char *lingware_path, double speed, double pitch,
+                      double volume, unsigned char **out_pcm,
+                      size_t *out_pcm_size, synth_error *err) {
+    int ok = 0;
+    pico_Status status;
+
+    void *pico_mem = NULL;
+    pico_System pico_system = NULL;
+    pico_Resource pico_ta = NULL;
+    pico_Resource pico_sg = NULL;
+    pico_Engine pico_engine = NULL;
+    int voice_created = 0;
+
+    pico_Char *ta_file = NULL;
+    pico_Char *sg_file = NULL;
+    pico_Char *ta_res_name = NULL;
+    pico_Char *sg_res_name = NULL;
+
+    char *synth_text =
+        build_synth_text(text_utf8, speed, pitch, volume, err);
+    if (!synth_text) {
+        return 0;
+    }
+
+    // Zeroed because Pico reads some of its pool before writing it, which
+    // otherwise makes the output vary between calls.
+    pico_mem = calloc(1, (size_t)PICO_MEM_SIZE);
+    ta_file = alloc_path_buf();
+    sg_file = alloc_path_buf();
+    ta_res_name = (pico_Char *)malloc((size_t)PICO_MAX_RESOURCE_NAME_SIZE);
+    sg_res_name = (pico_Char *)malloc((size_t)PICO_MAX_RESOURCE_NAME_SIZE);
+    if (!pico_mem || !ta_file || !sg_file || !ta_res_name || !sg_res_name) {
+        set_error(err, SYNTH_ERR_MEMORY, "out of memory");
+        goto cleanup;
+    }
+
+    if (!format_path(ta_file, lingware_path, pico_internal_ta[lang_index]) ||
+        !format_path(sg_file, lingware_path, pico_internal_sg[lang_index])) {
+        set_error(err, SYNTH_ERR_VALUE, "lingware_path too long");
+        goto cleanup;
+    }
+
+    status = pico_initialize(pico_mem, (pico_Int32)PICO_MEM_SIZE, &pico_system);
+    if (status != PICO_OK) {
+        set_pico_error(err, pico_system, status, "pico_initialize");
+        goto cleanup;
+    }
+
+    status = pico_loadResource(pico_system, ta_file, &pico_ta);
+    if (status != PICO_OK) {
+        set_pico_error(err, pico_system, status, "pico_loadResource ta");
+        goto cleanup;
+    }
+
+    status = pico_loadResource(pico_system, sg_file, &pico_sg);
+    if (status != PICO_OK) {
+        set_pico_error(err, pico_system, status, "pico_loadResource sg");
+        goto cleanup;
+    }
+
+    status = pico_getResourceName(pico_system, pico_ta, ta_res_name);
+    if (status != PICO_OK) {
+        set_pico_error(err, pico_system, status, "pico_getResourceName ta");
+        goto cleanup;
+    }
+
+    status = pico_getResourceName(pico_system, pico_sg, sg_res_name);
+    if (status != PICO_OK) {
+        set_pico_error(err, pico_system, status, "pico_getResourceName sg");
+        goto cleanup;
+    }
+
+    status = pico_createVoiceDefinition(pico_system, pico_voice_name);
+    if (status != PICO_OK) {
+        set_pico_error(err, pico_system, status, "pico_createVoiceDefinition");
+        goto cleanup;
+    }
+    voice_created = 1;
+
+    status = pico_addResourceToVoiceDefinition(pico_system, pico_voice_name,
+                                               ta_res_name);
+    if (status != PICO_OK) {
+        set_pico_error(err, pico_system, status,
+                       "pico_addResourceToVoiceDefinition ta");
+        goto cleanup;
+    }
+
+    status = pico_addResourceToVoiceDefinition(pico_system, pico_voice_name,
+                                               sg_res_name);
+    if (status != PICO_OK) {
+        set_pico_error(err, pico_system, status,
+                       "pico_addResourceToVoiceDefinition sg");
+        goto cleanup;
+    }
+
+    status = pico_newEngine(pico_system, pico_voice_name, &pico_engine);
+    if (status != PICO_OK) {
+        set_pico_error(err, pico_system, status, "pico_newEngine");
+        goto cleanup;
+    }
+
+    ok = synthesize_to_pcm(pico_system, pico_engine, synth_text, out_pcm,
+                           out_pcm_size, err);
+
+cleanup:
+    if (pico_engine)
+        pico_disposeEngine(pico_system, &pico_engine);
+    if (voice_created)
+        pico_releaseVoiceDefinition(pico_system, (pico_Char *)pico_voice_name);
+    if (pico_ta)
+        pico_unloadResource(pico_system, &pico_ta);
+    if (pico_sg)
+        pico_unloadResource(pico_system, &pico_sg);
+    if (pico_system)
+        pico_terminate(&pico_system);
+
+    free(ta_file);
+    free(sg_file);
+    free(ta_res_name);
+    free(sg_res_name);
+    free(pico_mem);
+    free(synth_text);
+
+    return ok;
 }
 
 static PyObject *nanotts_speak(PyObject *self, PyObject *args,
@@ -363,10 +494,16 @@ static PyObject *nanotts_speak(PyObject *self, PyObject *args,
     // Defaults
     const char *voice_cstr = "en-GB";
     const char *lingware_path = "./lang";
+    const char *text_utf8 = NULL;
 
     PyObject *voice_bytes = NULL;
     PyObject *lingware_bytes = NULL;
     PyObject *text_bytes = NULL;
+    PyObject *result = NULL;
+
+    double speed = -1.0;
+    double pitch = -1.0;
+    double volume = -1.0;
 
     // Parse: required unicode text + optional objects
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "U|OOOOO", kwlist, &text_obj,
@@ -378,10 +515,10 @@ static PyObject *nanotts_speak(PyObject *self, PyObject *args,
     if (voice_obj != Py_None) {
         if (!PyUnicode_Check(voice_obj)) {
             PyErr_SetString(PyExc_TypeError, "voice must be a string or None");
-            return NULL;
+            goto done;
         }
         if (!unicode_to_utf8_bytes(voice_obj, &voice_bytes, &voice_cstr)) {
-            return NULL;
+            goto done;
         }
     }
 
@@ -389,250 +526,65 @@ static PyObject *nanotts_speak(PyObject *self, PyObject *args,
         if (!PyUnicode_Check(lingware_obj)) {
             PyErr_SetString(PyExc_TypeError,
                             "lingware_path must be a string or None");
-            Py_XDECREF(voice_bytes);
-            return NULL;
+            goto done;
         }
         if (!unicode_to_utf8_bytes(lingware_obj, &lingware_bytes,
                                    &lingware_path)) {
-            Py_XDECREF(voice_bytes);
-            return NULL;
+            goto done;
         }
     }
-
-    double speed = -1.0;
-    double pitch = -1.0;
-    double volume = -1.0;
 
     if (speed_obj != Py_None) {
         speed = PyFloat_AsDouble(speed_obj);
         if (PyErr_Occurred())
-            goto py_fail;
+            goto done;
     }
     if (pitch_obj != Py_None) {
         pitch = PyFloat_AsDouble(pitch_obj);
         if (PyErr_Occurred())
-            goto py_fail;
+            goto done;
     }
     if (volume_obj != Py_None) {
         volume = PyFloat_AsDouble(volume_obj);
         if (PyErr_Occurred())
-            goto py_fail;
+            goto done;
     }
 
     const int lang_index = find_voice_index(voice_cstr);
     if (lang_index < 0) {
         PyErr_SetString(PyExc_ValueError, "Unsupported voice");
-        goto py_fail;
+        goto done;
     }
 
-    const char *text_utf8 = NULL;
     if (!unicode_to_utf8_bytes(text_obj, &text_bytes, &text_utf8)) {
-        goto py_fail;
+        goto done;
     }
 
-    int synth_need_free = 0;
-    char *synth_text =
-        build_synth_text(text_utf8, speed, pitch, volume, &synth_need_free);
-    if (!synth_text) {
-        goto py_fail;
-    }
-
-    void *pico_mem = malloc((size_t)PICO_MEM_SIZE);
-    if (!pico_mem) {
-        PyErr_NoMemory();
-        goto c_fail;
-    }
-
-    pico_System pico_system = NULL;
-    pico_Resource pico_ta = NULL;
-    pico_Resource pico_sg = NULL;
-    pico_Engine pico_engine = NULL;
-
-    pico_Char *ta_file = NULL;
-    pico_Char *sg_file = NULL;
-
-    pico_Char *ta_res_name = NULL;
-    pico_Char *sg_res_name = NULL;
-
-    pico_Retstring out_msg;
-    pico_Status status;
-
-    status = pico_initialize(pico_mem, (pico_Int32)PICO_MEM_SIZE, &pico_system);
-    if (status != PICO_OK) {
-        if (pico_system) {
-            pico_getSystemStatusMessage(pico_system, status, out_msg);
-            PyErr_Format(PyExc_RuntimeError, "pico_initialize failed: %s",
-                         out_msg);
-        } else {
-            PyErr_Format(PyExc_RuntimeError,
-                         "pico_initialize failed with status %d", (int)status);
-        }
-        goto pico_fail;
-    }
-
-    ta_file = alloc_path_buf();
-    sg_file = alloc_path_buf();
-    if (!ta_file || !sg_file) {
-        PyErr_NoMemory();
-        goto pico_fail;
-    }
-
-    if (!format_path(ta_file, lingware_path, pico_internal_ta[lang_index]) ||
-        !format_path(sg_file, lingware_path, pico_internal_sg[lang_index])) {
-        PyErr_SetString(PyExc_ValueError, "lingware_path too long");
-        goto pico_fail;
-    }
-
-    status = pico_loadResource(pico_system, ta_file, &pico_ta);
-    if (status != PICO_OK) {
-        pico_getSystemStatusMessage(pico_system, status, out_msg);
-        PyErr_Format(PyExc_RuntimeError, "pico_loadResource ta failed: %s",
-                     out_msg);
-        goto pico_fail;
-    }
-
-    status = pico_loadResource(pico_system, sg_file, &pico_sg);
-    if (status != PICO_OK) {
-        pico_getSystemStatusMessage(pico_system, status, out_msg);
-        PyErr_Format(PyExc_RuntimeError, "pico_loadResource sg failed: %s",
-                     out_msg);
-        goto pico_fail;
-    }
-
-    ta_res_name = (pico_Char *)malloc((size_t)PICO_MAX_RESOURCE_NAME_SIZE);
-    sg_res_name = (pico_Char *)malloc((size_t)PICO_MAX_RESOURCE_NAME_SIZE);
-    if (!ta_res_name || !sg_res_name) {
-        PyErr_NoMemory();
-        goto pico_fail;
-    }
-
-    status = pico_getResourceName(pico_system, pico_ta, ta_res_name);
-    if (status != PICO_OK) {
-        pico_getSystemStatusMessage(pico_system, status, out_msg);
-        PyErr_Format(PyExc_RuntimeError, "pico_getResourceName ta failed: %s",
-                     out_msg);
-        goto pico_fail;
-    }
-
-    status = pico_getResourceName(pico_system, pico_sg, sg_res_name);
-    if (status != PICO_OK) {
-        pico_getSystemStatusMessage(pico_system, status, out_msg);
-        PyErr_Format(PyExc_RuntimeError, "pico_getResourceName sg failed: %s",
-                     out_msg);
-        goto pico_fail;
-    }
-
-    status = pico_createVoiceDefinition(pico_system, pico_voice_name);
-    if (status != PICO_OK) {
-        pico_getSystemStatusMessage(pico_system, status, out_msg);
-        PyErr_Format(PyExc_RuntimeError,
-                     "pico_createVoiceDefinition failed: %s", out_msg);
-        goto pico_fail;
-    }
-
-    status = pico_addResourceToVoiceDefinition(pico_system, pico_voice_name,
-                                               ta_res_name);
-    if (status != PICO_OK) {
-        pico_getSystemStatusMessage(pico_system, status, out_msg);
-        PyErr_Format(PyExc_RuntimeError,
-                     "pico_addResourceToVoiceDefinition ta failed: %s",
-                     out_msg);
-        goto pico_fail;
-    }
-
-    status = pico_addResourceToVoiceDefinition(pico_system, pico_voice_name,
-                                               sg_res_name);
-    if (status != PICO_OK) {
-        pico_getSystemStatusMessage(pico_system, status, out_msg);
-        PyErr_Format(PyExc_RuntimeError,
-                     "pico_addResourceToVoiceDefinition sg failed: %s",
-                     out_msg);
-        goto pico_fail;
-    }
-
-    status = pico_newEngine(pico_system, pico_voice_name, &pico_engine);
-    if (status != PICO_OK) {
-        pico_getSystemStatusMessage(pico_system, status, out_msg);
-        PyErr_Format(PyExc_RuntimeError, "pico_newEngine failed: %s", out_msg);
-        goto pico_fail;
-    }
-
+    // The C strings stay valid without the GIL: they point into bytes objects
+    // we hold references to, and bytes are immutable.
     unsigned char *pcm_data = NULL;
     size_t pcm_size = 0;
+    synth_error err = {SYNTH_OK, ""};
+    int ok;
 
-    if (!synthesize_to_pcm(pico_system, pico_engine, synth_text, &pcm_data,
-                           &pcm_size)) {
-        goto pico_fail_pcm; // Python error already set
+    Py_BEGIN_ALLOW_THREADS
+    ok = synthesize(text_utf8, lang_index, lingware_path, speed, pitch, volume,
+                    &pcm_data, &pcm_size, &err);
+    Py_END_ALLOW_THREADS
+
+    if (ok) {
+        result = PyBytes_FromStringAndSize((const char *)pcm_data,
+                                           (Py_ssize_t)pcm_size);
+    } else {
+        raise_synth_error(&err);
     }
-
-    PyObject *result =
-        PyBytes_FromStringAndSize((const char *)pcm_data, (Py_ssize_t)pcm_size);
-    if (!result) {
-        free(pcm_data);
-        goto pico_fail;
-    }
-
     free(pcm_data);
 
-    // Normal cleanup
-    if (pico_engine) {
-        pico_disposeEngine(pico_system, &pico_engine);
-        pico_releaseVoiceDefinition(pico_system, (pico_Char *)pico_voice_name);
-    }
-    if (pico_ta)
-        pico_unloadResource(pico_system, &pico_ta);
-    if (pico_sg)
-        pico_unloadResource(pico_system, &pico_sg);
-    if (pico_system)
-        pico_terminate(&pico_system);
-
-    free(ta_file);
-    free(sg_file);
-    free(ta_res_name);
-    free(sg_res_name);
-    free(pico_mem);
-
-    if (synth_need_free)
-        free(synth_text);
+done:
     Py_XDECREF(text_bytes);
     Py_XDECREF(voice_bytes);
     Py_XDECREF(lingware_bytes);
-
     return result;
-
-pico_fail_pcm:
-    // synthesize_to_pcm freed partial buffers on failure
-pico_fail:
-    if (pico_engine) {
-        pico_disposeEngine(pico_system, &pico_engine);
-        pico_releaseVoiceDefinition(pico_system, (pico_Char *)pico_voice_name);
-    }
-    if (pico_ta)
-        pico_unloadResource(pico_system, &pico_ta);
-    if (pico_sg)
-        pico_unloadResource(pico_system, &pico_sg);
-    if (pico_system)
-        pico_terminate(&pico_system);
-
-    free(ta_file);
-    free(sg_file);
-    free(ta_res_name);
-    free(sg_res_name);
-    free(pico_mem);
-
-c_fail:
-    if (synth_need_free)
-        free(synth_text);
-    Py_XDECREF(text_bytes);
-    Py_XDECREF(voice_bytes);
-    Py_XDECREF(lingware_bytes);
-    return NULL;
-
-py_fail:
-    Py_XDECREF(text_bytes);
-    Py_XDECREF(voice_bytes);
-    Py_XDECREF(lingware_bytes);
-    return NULL;
 }
 
 static PyMethodDef NanottsMethods[] = {{"speak", (PyCFunction)nanotts_speak,
